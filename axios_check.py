@@ -32,6 +32,35 @@ import glob
 import argparse
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional
+
+
+def _run(cmd: list[str], timeout: int = 10) -> Optional[str]:
+    """
+    Uruchom polecenie i zwróć stdout jako str lub None przy błędzie.
+    Wymusza UTF-8 z fallback errors='replace' — odporna na cp1250/cp852
+    i inne locale Windows które sypią UnicodeDecodeError w _readerthread.
+    capture_output=True + encoding=None → bytes, dekodujemy sami.
+    """
+    try:
+        r = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        raw = r.stdout or b""
+        # Próbuj UTF-8, potem cp1250 (Windows PL), potem latin-1 (nigdy nie rzuca)
+        for enc in ("utf-8", "cp1250", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("latin-1", errors="replace")
+    except FileNotFoundError:
+        return None  # polecenie nie istnieje
+    except Exception:
+        return None
 
 # ─────────────────────────────────────────────
 #  IOC / stałe ataku
@@ -202,29 +231,17 @@ def check_lockfile(root: Path):
 def get_global_nm_paths() -> list[Path]:
     candidates = []
 
-    # npm
-    try:
-        r = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            candidates.append(Path(r.stdout.strip()))
-    except Exception:
-        pass
+    out = _run(["npm", "root", "-g"])
+    if out and out.strip():
+        candidates.append(Path(out.strip()))
 
-    # yarn global
-    try:
-        r = subprocess.run(["yarn", "global", "dir"], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            candidates.append(Path(r.stdout.strip()) / "node_modules")
-    except Exception:
-        pass
+    out = _run(["yarn", "global", "dir"])
+    if out and out.strip():
+        candidates.append(Path(out.strip()) / "node_modules")
 
-    # pnpm
-    try:
-        r = subprocess.run(["pnpm", "root", "-g"], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            candidates.append(Path(r.stdout.strip()))
-    except Exception:
-        pass
+    out = _run(["pnpm", "root", "-g"])
+    if out and out.strip():
+        candidates.append(Path(out.strip()))
 
     return [p for p in candidates if p.exists()]
 
@@ -291,25 +308,24 @@ def check_rat_artifacts():
 
 def check_processes():
     os_name = platform.system()
-    try:
-        if os_name in ("Linux", "Darwin"):
-            r = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=10)
-            lines = r.stdout.splitlines()
-            for line in lines:
-                if "ld.py" in line or C2_DOMAIN in line or C2_IP in line:
-                    hit("CRITICAL", "Podejrzany proces",
-                        "ps aux", line.strip())
-        elif os_name == "Windows":
-            r = subprocess.run(
-                ["tasklist", "/fo", "csv", "/v"],
-                capture_output=True, text=True, timeout=10
-            )
-            for line in r.stdout.splitlines():
-                if "ld.py" in line.lower() or "system.bat" in line.lower():
-                    hit("CRITICAL", "Podejrzany proces (Windows)",
-                        "tasklist", line.strip())
-    except Exception as e:
-        print(f"  {YEL}[WARN]{RST} Nie można sprawdzić procesów: {e}")
+    if os_name in ("Linux", "Darwin"):
+        out = _run(["ps", "aux"])
+        if out is None:
+            print(f"  {YEL}[WARN]{RST} ps aux niedostępne")
+            return
+        for line in out.splitlines():
+            if "ld.py" in line or C2_DOMAIN in line or C2_IP in line:
+                hit("CRITICAL", "Podejrzany proces", "ps aux", line.strip())
+    elif os_name == "Windows":
+        # /v generuje verbose output z dowolnymi stringami (np. ścieżki z akcentami)
+        # co wysadza cp1250 — używamy prostego /fo csv bez /v
+        out = _run(["tasklist", "/fo", "csv"], timeout=15)
+        if out is None:
+            print(f"  {YEL}[WARN]{RST} tasklist niedostępne")
+            return
+        for line in out.splitlines():
+            if "ld.py" in line.lower() or "system.bat" in line.lower():
+                hit("CRITICAL", "Podejrzany proces (Windows)", "tasklist /fo csv", line.strip())
 
 
 # ─────────────────────────────────────────────
@@ -334,55 +350,39 @@ def check_network():
             pass
 
     # netstat / ss
-    try:
-        if os_name in ("Linux", "Darwin"):
-            cmd = ["ss", "-tnp"] if os_name == "Linux" else ["netstat", "-an"]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            for line in r.stdout.splitlines():
+    if os_name in ("Linux", "Darwin"):
+        cmd = ["ss", "-tnp"] if os_name == "Linux" else ["netstat", "-an"]
+        out = _run(cmd)
+        if out:
+            for line in out.splitlines():
                 if C2_IP in line or C2_DOMAIN in line:
                     hit("CRITICAL", "Aktywne połączenie z C2",
                         " ".join(cmd), line.strip())
-        elif os_name == "Windows":
-            r = subprocess.run(["netstat", "-an"], capture_output=True, text=True, timeout=10)
-            for line in r.stdout.splitlines():
+    elif os_name == "Windows":
+        out = _run(["netstat", "-an"])
+        if out:
+            for line in out.splitlines():
                 if C2_IP in line:
                     hit("CRITICAL", "Aktywne połączenie z C2 (Windows)",
                         "netstat -an", line.strip())
-    except Exception as e:
-        print(f"  {YEL}[WARN]{RST} Nie można sprawdzić sieci: {e}")
 
     # DNS cache (Linux systemd-resolved)
     if os_name == "Linux":
-        try:
-            r = subprocess.run(
-                ["resolvectl", "statistics"],
-                capture_output=True, text=True, timeout=5
-            )
-            # nie ma bezpośredniego wyciągu historii w resolvectl, ale sprawdź /run/systemd/resolve
-            cache_dir = Path("/run/systemd/resolve")
-            if cache_dir.exists():
-                for f in cache_dir.rglob("*"):
-                    try:
-                        if C2_DOMAIN in f.read_text(errors="replace"):
-                            hit("WARN", "C2 domain w cache systemd-resolved",
-                                str(f), C2_DOMAIN)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        cache_dir = Path("/run/systemd/resolve")
+        if cache_dir.exists():
+            for f in cache_dir.rglob("*"):
+                try:
+                    if C2_DOMAIN in f.read_text(errors="replace"):
+                        hit("WARN", "C2 domain w cache systemd-resolved", str(f), C2_DOMAIN)
+                except Exception:
+                    pass
 
     # macOS DNS cache — nie ma łatwego odczytu, pomiń
     # Sprawdź npm cache — czy zawiera plain-crypto-js
-    try:
-        r = subprocess.run(
-            ["npm", "cache", "ls", "--json"],
-            capture_output=True, text=True, timeout=15
-        )
-        if MALICIOUS_DEP in r.stdout:
-            hit("WARN", "plain-crypto-js w npm cache",
-                "npm cache", f"{MALICIOUS_DEP} znaleziony w lokalnym cache npm — wyczyść: npm cache clean --force")
-    except Exception:
-        pass
+    out = _run(["npm", "cache", "ls", "--json"], timeout=15)
+    if out and MALICIOUS_DEP in out:
+        hit("WARN", "plain-crypto-js w npm cache",
+            "npm cache", f"{MALICIOUS_DEP} znaleziony w lokalnym cache npm — wyczyść: npm cache clean --force")
 
 
 # ─────────────────────────────────────────────
