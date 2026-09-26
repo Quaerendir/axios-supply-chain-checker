@@ -193,5 +193,15 @@ class Artifacts(Base):
             self.assertEqual(self.run_artifacts("Linux", []), [])
 
 
+class Cli(unittest.TestCase):
+    def test_version_flag(self):
+        import subprocess
+        script = Path(__file__).resolve().parent.parent / "axios_check.py"
+        out = subprocess.run([sys.executable, str(script), "--version"],
+                             stdout=subprocess.PIPE, universal_newlines=True)
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual(out.stdout.strip(), f"axios-supply-chain-checker {ac.__version__}")
+
+
 if __name__ == "__main__":
     unittest.main()

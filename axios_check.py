@@ -38,6 +38,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
+__version__ = "1.1.0"
+
 
 def _run(cmd: list[str], timeout: int = 10) -> Optional[str]:
     """
@@ -148,7 +150,8 @@ def banner():
     print(f"""
 {BOLD}{CYN}╔══════════════════════════════════════════════════════════════╗
 ║         axios supply-chain RAT checker  —  2026-03-31        ║
-║   CVE/GHSA: GHSA-fw8c-xr5c-95f9 / MAL-2026-2306             ║
+║         v{__version__:<52}║
+║   CVE/GHSA: GHSA-fw8c-xr5c-95f9 / MAL-2026-2306              ║
 ╚══════════════════════════════════════════════════════════════╝{RST}
   Platforma : {platform.system()} {platform.release()} [{platform.machine()}]
   Python    : {sys.version.split()[0]}
@@ -571,6 +574,11 @@ def main():
         help="Pomiń sprawdzanie sieci/procesów"
     )
     parser.add_argument(
+        "--version",
+        action="version",
+        version=f"axios-supply-chain-checker {__version__}"
+    )
+    parser.add_argument(
         "--json-out",
         metavar="FILE",
         help="Zapisz wyniki jako JSON do pliku"
@@ -631,6 +639,7 @@ def main():
 
     if args.json_out:
         out = {
+            "version": __version__,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "platform": f"{platform.system()} {platform.release()}",
             "scanned_paths": [str(r) for r in scan_roots],
