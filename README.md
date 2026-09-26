@@ -28,7 +28,7 @@ Złośliwa zależność `plain-crypto-js@4.2.1` (nigdy nie importowana w kodzie 
 
 RAT zbierał: SSH keys, API keys, cloud credentials, npm tokens, zmienne środowiskowe, listę procesów, strukturę katalogów — i co 60 sekund wysyłał dane do C2.
 
-Na Windows tworzył persistence przez `%PROGRAMDATA%\system.bat` + Registry Run key.
+Artefakty payloadu: Linux `/tmp/ld.py`, macOS `/Library/Caches/com.apple.act.mond`, Windows `%PROGRAMDATA%\wt.exe` (kopia PowerShell) oraz tymczasowe droppery `6202033` (`$TMPDIR/6202033`, `%TEMP%\6202033.vbs` / `.ps1`).
 
 **Jeśli zainstalowałeś axios w oknie 2026-03-31 00:21–03:29 UTC — zakładaj pełny kompromis maszyny.**
 
@@ -70,11 +70,11 @@ python3 axios_check.py
 
 | # | Check | Opis |
 |---|---|---|
-| 1 | `package.json` (rekursywnie) | Szuka `axios@1.14.1/0.30.4` i `plain-crypto-js@4.2.1` |
-| 2 | Lockfiles | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` |
+| 1 | `package.json` (rekursywnie) | Szuka `axios@1.14.1/0.30.4` i `plain-crypto-js@4.2.1`; zakresy `^`/`~` obejmujące złą wersję → INFO |
+| 2 | Lockfiles | `package-lock.json` (v1–v3), `yarn.lock` (v1 i berry), `pnpm-lock.yaml` |
 | 3 | Globalne node_modules | npm / yarn / pnpm global root |
-| 4 | RAT artefakty | `/tmp/ld.py` (Linux/macOS), `%PROGRAMDATA%\system.bat`, Registry Run key (Windows) |
-| 5 | Procesy | Orphaned `python3 ld.py` w `ps aux` / `tasklist` |
+| 4 | RAT artefakty | `/tmp/ld.py` (Linux), `/Library/Caches/com.apple.act.mond` (macOS), `%PROGRAMDATA%\wt.exe` + `%TEMP%\6202033.vbs/.ps1` (Windows), `$TMPDIR/6202033` |
+| 5 | Procesy | `ld.py`, `com.apple.act.mond`, `6202033`, C2 w `ps aux`; na Windows ścieżka `%PROGRAMDATA%\wt.exe` (Win32_Process) |
 | 6 | Sieć | `sfrclak.com` / `142.11.206.73` w `/etc/hosts`, `ss`/`netstat` |
 | 7 | npm cache | `plain-crypto-js` w lokalnym cache npm |
 | 8 | npm logs | Ostatnie 20 logów npm pod kątem wzmianek |
@@ -121,7 +121,7 @@ The injected dependency `plain-crypto-js@4.2.1` (never imported in axios source)
 2. Launched it as an orphaned background process
 3. **Self-destructed**, removing all evidence from `node_modules`
 
-The RAT harvested SSH keys, API keys, cloud credentials, npm tokens, env vars, process lists and directory trees — beaconing every 60 seconds to C2. On Windows it established persistence via `%PROGRAMDATA%\system.bat` + Registry Run key.
+The RAT harvested SSH keys, API keys, cloud credentials, npm tokens, env vars, process lists and directory trees — beaconing every 60 seconds to C2. Payload artefacts: Linux `/tmp/ld.py`, macOS `/Library/Caches/com.apple.act.mond`, Windows `%PROGRAMDATA%\wt.exe` (a renamed PowerShell copy), plus temporary `6202033` droppers (`$TMPDIR/6202033`, `%TEMP%\6202033.vbs` / `.ps1`).
 
 **If you ran `npm install` during 2026-03-31 00:21–03:29 UTC — assume full machine compromise.**
 
@@ -162,14 +162,22 @@ python3 axios_check.py
 
 | # | Check | Description |
 |---|---|---|
-| 1 | `package.json` (recursive) | Finds `axios@1.14.1/0.30.4` and `plain-crypto-js@4.2.1` |
-| 2 | Lockfiles | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` |
+| 1 | `package.json` (recursive) | Finds `axios@1.14.1/0.30.4` and `plain-crypto-js@4.2.1`; `^`/`~` ranges that admit a malicious version → INFO |
+| 2 | Lockfiles | `package-lock.json` (v1–v3), `yarn.lock` (classic and berry), `pnpm-lock.yaml` |
 | 3 | Global node_modules | npm / yarn / pnpm global root |
-| 4 | RAT artifacts | `/tmp/ld.py` (Linux/macOS), `%PROGRAMDATA%\system.bat`, Registry Run key (Windows) |
-| 5 | Processes | Orphaned `python3 ld.py` in `ps aux` / `tasklist` |
+| 4 | RAT artifacts | `/tmp/ld.py` (Linux), `/Library/Caches/com.apple.act.mond` (macOS), `%PROGRAMDATA%\wt.exe` + `%TEMP%\6202033.vbs/.ps1` (Windows), `$TMPDIR/6202033` |
+| 5 | Processes | `ld.py`, `com.apple.act.mond`, `6202033`, C2 in `ps aux`; on Windows the `%PROGRAMDATA%\wt.exe` path (Win32_Process) |
 | 6 | Network | `sfrclak.com` / `142.11.206.73` in `/etc/hosts`, `ss`/`netstat` |
 | 7 | npm cache | `plain-crypto-js` in local npm cache |
 | 8 | npm logs | Last 20 npm log files for any mentions |
+
+### Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+CI runs them on Python 3.8, 3.9, 3.12 and 3.13.
 
 ### Exit codes
 
@@ -213,9 +221,10 @@ If CRITICAL findings are detected:
 | C2 domain | `sfrclak[.]com` |
 | C2 IP | `142.11.206.73` |
 | C2 port | `8000` |
+| C2 path / dropper ID | `/6202033` (`$TMPDIR/6202033`, `%TEMP%\6202033.vbs`, `%TEMP%\6202033.ps1`) |
 | Linux RAT path | `/tmp/ld.py` |
-| Windows persistence | `%PROGRAMDATA%\system.bat` |
-| Windows registry | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` |
+| macOS RAT path | `/Library/Caches/com.apple.act.mond` |
+| Windows artefact | `%PROGRAMDATA%\wt.exe` (renamed PowerShell copy) |
 | npm publisher (attacker) | `nrwise` (email: `nrwise@proton.me`) |
 | Compromised maintainer | `jasonsaayman` |
 

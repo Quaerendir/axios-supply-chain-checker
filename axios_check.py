@@ -22,6 +22,10 @@ Autor: Quaerendir
 Licencja: MIT
 """
 
+# list[str] etc. in annotations need Python 3.9; with postponed evaluation
+# they are never evaluated, so the script runs on 3.8 as documented.
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -71,9 +75,11 @@ MALICIOUS_DEP     = "plain-crypto-js"
 MALICIOUS_DEP_VER = "4.2.1"
 C2_DOMAIN         = "sfrclak.com"
 C2_IP             = "142.11.206.73"
+# Payload artefacts per platform, as reported by StepSecurity, Snyk and Socket.
 RAT_SCRIPT_LINUX  = "/tmp/ld.py"
-RAT_PERSISTENCE_WIN = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "system.bat")
-RAT_REGISTRY_KEY  = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+RAT_BINARY_MACOS  = "/Library/Caches/com.apple.act.mond"
+RAT_PS_COPY_WIN   = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "wt.exe")
+DROPPER_ID        = "6202033"   # C2 path and temp dropper name: $TMPDIR/6202033, %TEMP%\6202033.vbs/.ps1
 ATTACK_WINDOW_UTC = ("2026-03-31T00:21:00Z", "2026-03-31T03:29:00Z")
 
 BOLD  = "\033[1m"
@@ -84,6 +90,58 @@ CYN   = "\033[96m"
 RST   = "\033[0m"
 
 findings: list[dict] = []
+
+
+def _mentions_bad_axios(text: str) -> Optional[str]:
+    """Malicious axios version named as axios@X or axios/X in text, else None.
+    Bounded on both sides so e.g. axios@1.14.10 or my-axios@1.14.1 don't match."""
+    for bad in sorted(MALICIOUS_AXIOS):
+        if re.search(r"(?<![\w.-])axios[@/]" + re.escape(bad) + r"(?![0-9])", text):
+            return bad
+    return None
+
+
+def _mentions_bad_dep(text: str) -> bool:
+    return re.search(r"(?<![\w.-])" + re.escape(MALICIOUS_DEP) + r"[@/]"
+                     + re.escape(MALICIOUS_DEP_VER) + r"(?![0-9])", text) is not None
+
+
+def _parse_ver(v: str) -> Optional[tuple]:
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", v.strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _spec_admits_bad(spec: str) -> Optional[tuple]:
+    """(bad_version, exact) if an npm version spec admits a malicious axios
+    version: exact pins and simple ^/~ ranges. Anything more complex (||,
+    comparators, x-ranges, tags) returns None; the lockfile shows what was
+    actually installed."""
+    spec = spec.strip()
+    op = spec[:1] if spec[:1] in "^~=" else ""
+    base = _parse_ver(spec[len(op):])
+    if base is None:
+        return None
+    for bad in sorted(MALICIOUS_AXIOS):
+        b = _parse_ver(bad)
+        if op in ("", "="):
+            if b == base:
+                return bad, True
+        elif op == "~":
+            if b[:2] == base[:2] and b >= base:
+                return bad, False
+        elif op == "^":
+            same = b[0] == base[0] if base[0] != 0 else b[:2] == base[:2]
+            if same and b >= base:
+                return bad, False
+    return None
+
+
+def _files(root: Path, name: str, skip_node_modules: bool = False):
+    """root.rglob(name) without anything under .git (and node_modules if asked)."""
+    for f in root.rglob(name):
+        if ".git" in f.parts or (skip_node_modules and "node_modules" in f.parts):
+            continue
+        yield f
 
 
 def banner():
@@ -118,7 +176,7 @@ def ok(msg: str):
 def check_package_json(root: Path):
     """Rekursywne przeszukiwanie package.json — pomija .git, node_modules/*/node_modules głęboko."""
     found_any = False
-    for pj in root.rglob("package.json"):
+    for pj in _files(root, "package.json"):
         # Pomiń własne node_modules zagnieżdżone głębiej niż 2 poziomy
         parts = pj.parts
         nm_count = sum(1 for p in parts if p == "node_modules")
@@ -151,13 +209,18 @@ def check_package_json(root: Path):
         # Sprawdź dependencies (transitive przez vendoring)
         for dep_field in ("dependencies", "devDependencies", "optionalDependencies"):
             deps = data.get(dep_field, {})
-            if "axios" in deps:
+            if isinstance(deps, dict) and isinstance(deps.get("axios"), str):
                 ver_spec = deps["axios"]
-                # caret range mogła rozwiązać do złej wersji
-                if any(bad in ver_spec for bad in MALICIOUS_AXIOS):
+                admits = _spec_admits_bad(ver_spec)
+                if admits and admits[1]:
                     hit("WARN", "Bezpośrednia zależność od złej wersji axios",
                         str(pj),
                         f"{dep_field}[axios] = {ver_spec!r} — pinned do zainfekowanej wersji")
+                elif admits:
+                    # ^/~ range mogła rozwiązać się do złej wersji w oknie ataku
+                    hit("INFO", "Zakres wersji axios obejmuje złą wersję",
+                        str(pj),
+                        f"{dep_field}[axios] = {ver_spec!r} dopuszcza axios@{admits[0]} — sprawdź lockfile")
 
     if not found_any:
         ok(f"Brak złośliwych axios/plain-crypto-js w: {root}")
@@ -167,61 +230,105 @@ def check_package_json(root: Path):
 #  2. Lockfiles — sprawdź rozwiązane wersje
 # ─────────────────────────────────────────────
 
+def _npm_lock_entries(data: dict):
+    """(path, name, version) for every package in a package-lock.json: the
+    flat "packages" map (lockfileVersion 2/3), or the nested "dependencies"
+    tree of lockfileVersion 1 (npm <= 6)."""
+    packages = data.get("packages")
+    if isinstance(packages, dict) and packages:
+        for pkg_path, info in packages.items():
+            if isinstance(info, dict):
+                name = info.get("name") or pkg_path.rsplit("node_modules/", 1)[-1]
+                yield pkg_path, name, str(info.get("version", ""))
+        return
+
+    def walk(deps, prefix):
+        for name, info in (deps or {}).items():
+            if isinstance(info, dict):
+                path = f"{prefix}node_modules/{name}"
+                yield path, name, str(info.get("version", ""))
+                yield from walk(info.get("dependencies"), path + "/")
+    yield from walk(data.get("dependencies"), "")
+
+
+def _yarn_lock_entries(content: str):
+    """(names, version) for every entry of a yarn.lock, classic v1
+    (`version "1.2.3"`) or berry (`version: 1.2.3`)."""
+    names: list[str] = []
+    for line in content.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace():
+            # Entry header: one or more descriptors, e.g.
+            #   axios@^1.14.0, axios@^1.2.0:     "axios@npm:^1.14.0":
+            names = []
+            header = line.rstrip()
+            if header.endswith(":"):
+                for desc in header[:-1].split(","):
+                    desc = desc.strip().strip('"')
+                    at = desc.find("@", 1)   # from 1: skip a scope's leading @
+                    if at > 0:
+                        names.append(desc[:at])
+            continue
+        m = re.match(r'\s+version:?\s+"?([^"\s]+)"?\s*$', line)
+        if m and names:
+            yield names, m.group(1)
+            names = []
+
+
+def _flag_dep(source: str, path: str, version: str):
+    if version == MALICIOUS_DEP_VER:
+        hit("CRITICAL", f"{source} — plain-crypto-js", path,
+            f"{MALICIOUS_DEP}@{version} znaleziony w lockfile — MALWARE DROPPER")
+    else:
+        hit("WARN", f"{source} — plain-crypto-js", path,
+            f"{MALICIOUS_DEP}@{version or '?'} — pakiet atakującego (inna wersja niż dropper)")
+
+
 def check_lockfile(root: Path):
     # package-lock.json
-    for lf in root.rglob("package-lock.json"):
-        if "node_modules" in str(lf):
-            continue
+    for lf in _files(root, "package-lock.json", skip_node_modules=True):
         try:
             data = json.loads(lf.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             continue
-        packages = data.get("packages", {})
-        # npm v7+ format
-        for pkg_path, info in packages.items():
-            n = info.get("name", pkg_path.split("/")[-1] if "/" in pkg_path else "")
-            v = info.get("version", "")
-            if ("axios" in pkg_path or n == "axios") and v in MALICIOUS_AXIOS:
+        for _path, name, ver in _npm_lock_entries(data):
+            if name == "axios" and ver in MALICIOUS_AXIOS:
                 hit("CRITICAL", "package-lock.json — zainfekowany axios",
                     str(lf),
-                    f"Rozwiązany axios@{v} — lockfile może odzwierciedlać zainfekowaną instalację")
-            if MALICIOUS_DEP in pkg_path or n == MALICIOUS_DEP:
-                if v == MALICIOUS_DEP_VER:
-                    hit("CRITICAL", "package-lock.json — plain-crypto-js",
-                        str(lf),
-                        f"{MALICIOUS_DEP}@{v} znaleziony w lockfile")
+                    f"Rozwiązany axios@{ver} — lockfile może odzwierciedlać zainfekowaną instalację")
+            if name == MALICIOUS_DEP:
+                _flag_dep("package-lock.json", str(lf), ver)
 
-    # yarn.lock — prymitywne grep
-    for lf in root.rglob("yarn.lock"):
-        if "node_modules" in str(lf):
-            continue
+    # yarn.lock (v1 i berry)
+    for lf in _files(root, "yarn.lock", skip_node_modules=True):
         try:
             content = lf.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        for bad_ver in MALICIOUS_AXIOS:
-            if f'axios@' in content and f'"version" "{bad_ver}"' in content:
-                hit("WARN", "yarn.lock — podejrzana wersja axios",
-                    str(lf), f"Możliwy axios@{bad_ver} w yarn.lock")
-        if f'{MALICIOUS_DEP}@' in content:
-            hit("CRITICAL", "yarn.lock — plain-crypto-js",
-                str(lf), f"{MALICIOUS_DEP} znaleziony w yarn.lock")
+        for names, ver in _yarn_lock_entries(content):
+            if "axios" in names and ver in MALICIOUS_AXIOS:
+                hit("CRITICAL", "yarn.lock — zainfekowany axios",
+                    str(lf), f"Rozwiązany axios@{ver} w yarn.lock")
+            if MALICIOUS_DEP in names:
+                _flag_dep("yarn.lock", str(lf), ver)
 
     # pnpm-lock.yaml
-    for lf in root.rglob("pnpm-lock.yaml"):
-        if "node_modules" in str(lf):
-            continue
+    for lf in _files(root, "pnpm-lock.yaml", skip_node_modules=True):
         try:
             content = lf.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        if MALICIOUS_DEP in content:
+        if _mentions_bad_dep(content):
             hit("CRITICAL", "pnpm-lock.yaml — plain-crypto-js",
-                str(lf), f"{MALICIOUS_DEP} znaleziony w pnpm-lock.yaml")
-        for bad_ver in MALICIOUS_AXIOS:
-            if f"axios/{bad_ver}" in content or f"axios@{bad_ver}" in content:
-                hit("CRITICAL", "pnpm-lock.yaml — zainfekowany axios",
-                    str(lf), f"axios@{bad_ver} w pnpm-lock.yaml")
+                str(lf), f"{MALICIOUS_DEP}@{MALICIOUS_DEP_VER} znaleziony w pnpm-lock.yaml")
+        elif MALICIOUS_DEP in content:
+            hit("WARN", "pnpm-lock.yaml — plain-crypto-js",
+                str(lf), f"{MALICIOUS_DEP} (inna wersja) znaleziony w pnpm-lock.yaml")
+        bad = _mentions_bad_axios(content)
+        if bad:
+            hit("CRITICAL", "pnpm-lock.yaml — zainfekowany axios",
+                str(lf), f"axios@{bad} w pnpm-lock.yaml")
 
 
 # ─────────────────────────────────────────────
@@ -261,50 +368,42 @@ def check_global_nm():
 
 def check_rat_artifacts():
     os_name = platform.system()
-
-    # Linux / macOS — /tmp/ld.py
-    if os_name in ("Linux", "Darwin"):
-        p = Path(RAT_SCRIPT_LINUX)
-        if p.exists():
-            hit("CRITICAL", "RAT artefakt — /tmp/ld.py",
-                str(p), "Python RAT plik istnieje — MASZYNA MOŻE BYĆ SKOMPROMITOWANA")
-        else:
-            ok("/tmp/ld.py nie istnieje")
-
-    # Windows — system.bat + registry
+    tmp = os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp"
+    artifacts: dict[str, str] = {}
+    if os_name == "Linux":
+        artifacts[RAT_SCRIPT_LINUX] = "Python RAT (Linux)"
+    if os_name == "Darwin":
+        artifacts[RAT_BINARY_MACOS] = "RAT binary (macOS)"
     if os_name == "Windows":
-        bat = Path(RAT_PERSISTENCE_WIN)
-        if bat.exists():
-            hit("CRITICAL", "RAT persistence — system.bat",
-                str(bat), "Plik bat RAT dropper istnieje w %PROGRAMDATA%")
-        else:
-            ok(f"Brak {RAT_PERSISTENCE_WIN}")
+        artifacts[RAT_PS_COPY_WIN] = "kopia PowerShell używana przez RAT"
+        artifacts[os.path.join(tmp, f"{DROPPER_ID}.vbs")] = "dropper VBScript"
+        artifacts[os.path.join(tmp, f"{DROPPER_ID}.ps1")] = "payload PowerShell"
+    else:
+        for d in (tmp, "/tmp"):
+            artifacts[os.path.join(d, DROPPER_ID)] = "tymczasowy dropper"
 
-        # Registry Run key
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RAT_REGISTRY_KEY)
-            i = 0
-            while True:
-                try:
-                    name, val, _ = winreg.EnumValue(key, i)
-                    if "system.bat" in str(val).lower() or C2_DOMAIN in str(val).lower():
-                        hit("CRITICAL", "RAT persistence — Registry Run",
-                            f"HKLM\\{RAT_REGISTRY_KEY}\\{name}",
-                            f"Wartość: {val!r}")
-                    i += 1
-                except OSError:
-                    break
-            winreg.CloseKey(key)
-        except ImportError:
-            pass
-        except Exception as e:
-            print(f"  [WARN] Registry check: {e}")
+    for path, what in artifacts.items():
+        if Path(path).exists():
+            hit("CRITICAL", f"Artefakt RAT — {what}",
+                path, "Plik IOC istnieje — MASZYNA MOŻE BYĆ SKOMPROMITOWANA")
+        else:
+            ok(f"{path} nie istnieje")
 
 
 # ─────────────────────────────────────────────
 #  5. Procesy — orphaned python3 z ld.py
 # ─────────────────────────────────────────────
+
+# Command-line indicators. ld.py must be a whole path component, so e.g.
+# `python3 build.py` does not match.
+PROC_PATTERNS = [
+    re.compile(r"(^|[\s/\\])ld\.py(\s|$)"),
+    re.compile(re.escape(RAT_BINARY_MACOS)),
+    re.compile(r"(^|[\s/\\])" + DROPPER_ID + r"(\.vbs|\.ps1)?(\s|$)"),
+    re.compile(re.escape(C2_DOMAIN)),
+    re.compile(re.escape(C2_IP)),
+]
+
 
 def check_processes():
     os_name = platform.system()
@@ -314,18 +413,23 @@ def check_processes():
             print(f"  {YEL}[WARN]{RST} ps aux niedostępne")
             return
         for line in out.splitlines():
-            if "ld.py" in line or C2_DOMAIN in line or C2_IP in line:
+            if any(p.search(line) for p in PROC_PATTERNS):
                 hit("CRITICAL", "Podejrzany proces", "ps aux", line.strip())
     elif os_name == "Windows":
-        # /v generuje verbose output z dowolnymi stringami (np. ścieżki z akcentami)
-        # co wysadza cp1250 — używamy prostego /fo csv bez /v
-        out = _run(["tasklist", "/fo", "csv"], timeout=15)
+        # tasklist shows image names only, and wt.exe is also Windows
+        # Terminal's name, so match the full executable path instead.
+        out = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-CimInstance Win32_Process | ForEach-Object "
+                    "{ [string]$_.ExecutablePath + '|' + [string]$_.CommandLine }"],
+                   timeout=30)
         if out is None:
-            print(f"  {YEL}[WARN]{RST} tasklist niedostępne")
+            print(f"  {YEL}[WARN]{RST} PowerShell niedostępny — pominięto procesy")
             return
         for line in out.splitlines():
-            if "ld.py" in line.lower() or "system.bat" in line.lower():
-                hit("CRITICAL", "Podejrzany proces (Windows)", "tasklist /fo csv", line.strip())
+            exe, _, cmdline = line.partition("|")
+            if exe.strip().lower() == RAT_PS_COPY_WIN.lower() or \
+               any(p.search(cmdline) for p in PROC_PATTERNS):
+                hit("CRITICAL", "Podejrzany proces (Windows)", "Win32_Process", line.strip())
 
 
 # ─────────────────────────────────────────────
@@ -366,23 +470,19 @@ def check_network():
                     hit("CRITICAL", "Aktywne połączenie z C2 (Windows)",
                         "netstat -an", line.strip())
 
-    # DNS cache (Linux systemd-resolved)
-    if os_name == "Linux":
-        cache_dir = Path("/run/systemd/resolve")
-        if cache_dir.exists():
-            for f in cache_dir.rglob("*"):
-                try:
-                    if C2_DOMAIN in f.read_text(errors="replace"):
-                        hit("WARN", "C2 domain w cache systemd-resolved", str(f), C2_DOMAIN)
-                except Exception:
-                    pass
 
-    # macOS DNS cache — nie ma łatwego odczytu, pomiń
-    # Sprawdź npm cache — czy zawiera plain-crypto-js
+
+def check_npm_cache():
+    """plain-crypto-js w lokalnym cache npm (lokalny odczyt, bez sieci)."""
     out = _run(["npm", "cache", "ls", "--json"], timeout=15)
+    if out is None:
+        ok("npm niedostępny — pominięto cache")
+        return
     if out and MALICIOUS_DEP in out:
         hit("WARN", "plain-crypto-js w npm cache",
             "npm cache", f"{MALICIOUS_DEP} znaleziony w lokalnym cache npm — wyczyść: npm cache clean --force")
+    else:
+        ok("Brak plain-crypto-js w cache npm")
 
 
 # ─────────────────────────────────────────────
@@ -409,11 +509,11 @@ def check_npm_logs():
         for log_file in sorted(log_dir.glob("*.log"), reverse=True)[:20]:  # ostatnie 20
             try:
                 content = log_file.read_text(encoding="utf-8", errors="replace")
-                for bad_ver in MALICIOUS_AXIOS:
-                    if f"axios@{bad_ver}" in content or f"axios/{bad_ver}" in content:
-                        hit("WARN", "Ślad w logach npm",
-                            str(log_file),
-                            f"axios@{bad_ver} wzmiankowany w logach npm — sprawdź datę pliku")
+                bad_ver = _mentions_bad_axios(content)
+                if bad_ver:
+                    hit("WARN", "Ślad w logach npm",
+                        str(log_file),
+                        f"axios@{bad_ver} wzmiankowany w logach npm — sprawdź datę pliku")
                 if MALICIOUS_DEP in content:
                     hit("WARN", "plain-crypto-js w logach npm",
                         str(log_file), "Złośliwa zależność wzmiankowana w logach")
@@ -481,7 +581,7 @@ def main():
 
     scan_roots = [Path(p).resolve() for p in args.paths]
 
-    print(f"{BOLD}[1/7] Skanowanie package.json w podanych ścieżkach...{RST}")
+    print(f"{BOLD}[1/8] Skanowanie package.json w podanych ścieżkach...{RST}")
     for root in scan_roots:
         if not root.exists():
             print(f"  {YEL}[WARN]{RST} Ścieżka nie istnieje: {root}")
@@ -489,27 +589,30 @@ def main():
         check_package_json(root)
         check_lockfile(root)
 
-    print(f"\n{BOLD}[2/7] Globalne node_modules...{RST}")
+    print(f"\n{BOLD}[2/8] Globalne node_modules...{RST}")
     if not args.no_global:
         check_global_nm()
     else:
         print("  Pominięte (--no-global)")
 
-    print(f"\n{BOLD}[3/7] Artefakty RAT (pliki persistence)...{RST}")
+    print(f"\n{BOLD}[3/8] Artefakty RAT...{RST}")
     check_rat_artifacts()
 
     if not args.no_network:
-        print(f"\n{BOLD}[4/7] Procesy...{RST}")
+        print(f"\n{BOLD}[4/8] Procesy...{RST}")
         check_processes()
 
-        print(f"\n{BOLD}[5/7] Sieć — C2 IOC...{RST}")
+        print(f"\n{BOLD}[5/8] Sieć — C2 IOC...{RST}")
         check_network()
 
-    print(f"\n{BOLD}[6/7] Logi npm...{RST}")
+    print(f"\n{BOLD}[6/8] Cache npm...{RST}")
+    check_npm_cache()
+
+    print(f"\n{BOLD}[7/8] Logi npm...{RST}")
     check_npm_logs()
 
     # ── Podsumowanie ──
-    print(f"\n{BOLD}[7/7] PODSUMOWANIE{RST}")
+    print(f"\n{BOLD}[8/8] PODSUMOWANIE{RST}")
     print(f"  {'─'*50}")
     critical = [f for f in findings if f["severity"] == "CRITICAL"]
     warn     = [f for f in findings if f["severity"] == "WARN"]
